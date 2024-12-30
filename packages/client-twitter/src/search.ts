@@ -1,4 +1,3 @@
-import { SearchMode } from "agent-twitter-client";
 import { composeContext } from "@elizaos/core";
 import { generateMessageResponse, generateText } from "@elizaos/core";
 import { messageCompletionFooter } from "@elizaos/core";
@@ -10,10 +9,11 @@ import {
     ModelClass,
     ServiceType,
     State,
+    Memory,
 } from "@elizaos/core";
 import { stringToUuid } from "@elizaos/core";
-import { ClientBase } from "./base";
-import { buildConversationThread, sendTweet, wait } from "./utils.ts";
+import { ClientBase, ProcessedTweet } from "./base";
+import { buildConversationThread, wait } from "./utils.ts";
 
 const twitterSearchTemplate =
     `{{timeline}}
@@ -78,25 +78,24 @@ export class TwitterSearchClient {
             await new Promise((resolve) => setTimeout(resolve, 5000));
             const recentTweets = await this.client.fetchSearchTweets(
                 searchTerm,
-                20,
-                SearchMode.Top
+                20
             );
             console.log("Search tweets fetched");
 
-            const homeTimeline = await this.client.fetchHomeTimeline(50);
+            const processedTweet = await this.client.fetchHomeTimeline();
 
-            await this.client.cacheTimeline(homeTimeline);
+            await this.client.cacheTimeline(processedTweet);
 
             const formattedHomeTimeline =
                 `# ${this.runtime.character.name}'s Home Timeline\n\n` +
-                homeTimeline
+                processedTweet
                     .map((tweet) => {
-                        return `ID: ${tweet.id}\nFrom: ${tweet.name} (@${tweet.username})${tweet.inReplyToStatusId ? ` In reply to: ${tweet.inReplyToStatusId}` : ""}\nText: ${tweet.text}\n---\n`;
+                        return `ID: ${tweet.id}\nFrom: ${tweet.authorName} (@${tweet.username})${tweet.inReplyToStatusId ? ` In reply to: ${tweet.inReplyToStatusId}` : ""}\nText: ${tweet.text}\n---\n`;
                     })
                     .join("\n");
 
             // randomly slice .tweets down to 20
-            const slicedTweets = recentTweets.tweets
+            const slicedTweets = recentTweets
                 .sort(() => Math.random() - 0.5)
                 .slice(0, 20);
 
@@ -111,7 +110,7 @@ export class TwitterSearchClient {
             const prompt = `
   Here are some tweets related to the search term "${searchTerm}":
 
-  ${[...slicedTweets, ...homeTimeline]
+  ${[...slicedTweets, ...processedTweet]
       .filter((tweet) => {
           // ignore tweets where any of the thread tweets contain a tweet by the bot
           const thread = tweet.thread;
@@ -123,7 +122,7 @@ export class TwitterSearchClient {
       .map(
           (tweet) => `
     ID: ${tweet.id}${tweet.inReplyToStatusId ? ` In reply to: ${tweet.inReplyToStatusId}` : ""}
-    From: ${tweet.name} (@${tweet.username})
+    From: ${tweet.authorName} (@${tweet.username})
     Text: ${tweet.text}
   `
       )
@@ -167,13 +166,13 @@ export class TwitterSearchClient {
                 conversationId + "-" + this.runtime.agentId
             );
 
-            const userIdUUID = stringToUuid(selectedTweet.userId as string);
+            const userIdUUID = stringToUuid(selectedTweet.authorId as string);
 
             await this.runtime.ensureConnection(
                 userIdUUID,
                 roomId,
                 selectedTweet.username,
-                selectedTweet.name,
+                selectedTweet.authorName,
                 "twitter"
             );
 
@@ -212,9 +211,9 @@ export class TwitterSearchClient {
                 .join("\n");
 
             let tweetBackground = "";
-            if (selectedTweet.isRetweet) {
+            if (selectedTweet.referenced_tweets?.some((ref) => ref.type === "retweeted")) {
                 const originalTweet = await this.client.requestQueue.add(() =>
-                    this.client.twitterClient.getTweet(selectedTweet.id)
+                    this.client.getTweet(selectedTweet.id)
                 );
                 tweetBackground = `Retweeting @${originalTweet.username}: ${originalTweet.text}`;
             }
@@ -226,7 +225,7 @@ export class TwitterSearchClient {
                     .getService<IImageDescriptionService>(
                         ServiceType.IMAGE_DESCRIPTION
                     )
-                    .describeImage(photo.url);
+                    .describeImage(photo);
                 imageDescriptions.push(description);
             }
 
@@ -273,14 +272,19 @@ export class TwitterSearchClient {
             );
             try {
                 const callback: HandlerCallback = async (response: Content) => {
-                    const memories = await sendTweet(
-                        this.client,
-                        response,
-                        message.roomId,
-                        this.twitterUsername,
-                        tweetId
-                    );
-                    return memories;
+                    const tweet = await this.client.sendTweet(response.text, response.inReplyTo);
+
+                    // Convert the ProcessedTweet into Memory objects
+                    const memory: Memory = {
+                        id: stringToUuid(tweet.id),
+                        userId: stringToUuid(tweet.authorId),
+                        roomId: stringToUuid(tweet.conversationId),
+                        agentId: this.runtime.agentId,
+                        content: { text: tweet.text, url: tweet.permanentUrl },
+                        createdAt: tweet.timestamp! * 1000,
+                    };
+
+                    return [memory]; // Return as an array of Memory
                 };
 
                 const responseMessages = await callback(responseContent);

@@ -1,4 +1,3 @@
-import { Tweet } from "agent-twitter-client";
 import {
     composeContext,
     generateText,
@@ -9,7 +8,7 @@ import {
     parseBooleanFromText,
 } from "@elizaos/core";
 import { elizaLogger } from "@elizaos/core";
-import { ClientBase } from "./base.ts";
+import { ClientBase, ProcessedTweet} from "./base";
 import { postActionResponseFooter } from "@elizaos/core";
 import { generateTweetActions } from "@elizaos/core";
 import { IImageDescriptionService, ServiceType } from "@elizaos/core";
@@ -302,52 +301,24 @@ export class TwitterPostClient {
             try {
                 elizaLogger.log(`Posting new tweet:\n ${cleanedContent}`);
 
-                const result = await this.client.requestQueue.add(
+                const processedTweet = await this.client.requestQueue.add(
                     async () =>
-                        await this.client.twitterClient.sendTweet(
+                        await this.client.sendTweet(
                             cleanedContent
                         )
                 );
-                const body = await result.json();
-                if (!body?.data?.create_tweet?.tweet_results?.result) {
-                    console.error("Error sending tweet; Bad response:", body);
-                    return;
-                }
-                const tweetResult = body.data.create_tweet.tweet_results.result;
-
-                const tweet = {
-                    id: tweetResult.rest_id,
-                    name: this.client.profile.screenName,
-                    username: this.client.profile.username,
-                    text: tweetResult.legacy.full_text,
-                    conversationId: tweetResult.legacy.conversation_id_str,
-                    createdAt: tweetResult.legacy.created_at,
-                    timestamp: new Date(
-                        tweetResult.legacy.created_at
-                    ).getTime(),
-                    userId: this.client.profile.id,
-                    inReplyToStatusId:
-                        tweetResult.legacy.in_reply_to_status_id_str,
-                    permanentUrl: `https://twitter.com/${this.twitterUsername}/status/${tweetResult.rest_id}`,
-                    hashtags: [],
-                    mentions: [],
-                    photos: [],
-                    thread: [],
-                    urls: [],
-                    videos: [],
-                } as Tweet;
 
                 await this.runtime.cacheManager.set(
                     `twitter/${this.client.profile.username}/lastPost`,
                     {
-                        id: tweet.id,
+                        id: processedTweet.id,
                         timestamp: Date.now(),
                     }
                 );
 
-                await this.client.cacheTweet(tweet);
+                await this.client.cacheTweet(processedTweet);
 
-                elizaLogger.log(`Tweet posted:\n ${tweet.permanentUrl}`);
+                elizaLogger.log(`Tweet posted:\n ${processedTweet.permanentUrl}`);
 
                 await this.runtime.ensureRoomExists(roomId);
                 await this.runtime.ensureParticipantInRoom(
@@ -356,17 +327,17 @@ export class TwitterPostClient {
                 );
 
                 await this.runtime.messageManager.createMemory({
-                    id: stringToUuid(tweet.id + "-" + this.runtime.agentId),
+                    id: stringToUuid(processedTweet.id + "-" + this.runtime.agentId),
                     userId: this.runtime.agentId,
                     agentId: this.runtime.agentId,
                     content: {
                         text: newTweetContent.trim(),
-                        url: tweet.permanentUrl,
+                        url: processedTweet.permanentUrl,
                         source: "twitter",
                     },
                     roomId,
                     embedding: getEmbeddingZeroVector(),
-                    createdAt: tweet.timestamp,
+                    createdAt: processedTweet.timestamp,
                 });
             } catch (error) {
                 elizaLogger.error("Error sending tweet:", error);
@@ -466,10 +437,10 @@ export class TwitterPostClient {
                 "twitter"
             );
 
-            const homeTimeline = await this.client.fetchTimelineForActions(15);
+            const processedTweets = await this.client.fetchTimelineForActions(15);
             const results = [];
 
-            for (const tweet of homeTimeline) {
+            for (const tweet of processedTweets) {
                 try {
                     // Skip if we've already processed this tweet
                     const memory =
@@ -496,7 +467,7 @@ export class TwitterPostClient {
                         },
                         {
                             twitterUserName: this.twitterUsername,
-                            currentTweet: `ID: ${tweet.id}\nFrom: ${tweet.name} (@${tweet.username})\nText: ${tweet.text}`,
+                            currentTweet: `ID: ${tweet.id}\nFrom: ${tweet.authorName} (@${tweet.username})\nText: ${tweet.text}`,
                         }
                     );
 
@@ -526,7 +497,7 @@ export class TwitterPostClient {
                     // Execute actions
                     if (actionResponse.like) {
                         try {
-                            await this.client.twitterClient.likeTweet(tweet.id);
+                            await this.client.likeTweet(tweet.id);
                             executedActions.push("like");
                             elizaLogger.log(`Liked tweet ${tweet.id}`);
                         } catch (error) {
@@ -539,7 +510,7 @@ export class TwitterPostClient {
 
                     if (actionResponse.retweet) {
                         try {
-                            await this.client.twitterClient.retweet(tweet.id);
+                            await this.client.retweetTweet(tweet.id);
                             executedActions.push("retweet");
                             elizaLogger.log(`Retweeted tweet ${tweet.id}`);
                         } catch (error) {
@@ -575,18 +546,18 @@ export class TwitterPostClient {
                                         .getService<IImageDescriptionService>(
                                             ServiceType.IMAGE_DESCRIPTION
                                         )
-                                        .describeImage(photo.url);
+                                        .describeImage(photo);
                                     imageDescriptions.push(description);
                                 }
                             }
 
                             // Handle quoted tweet if present
                             let quotedContent = "";
-                            if (tweet.quotedStatusId) {
+                            if (tweet.id) {
                                 try {
                                     const quotedTweet =
-                                        await this.client.twitterClient.getTweet(
-                                            tweet.quotedStatusId
+                                        await this.client.getTweet(
+                                            tweet.id
                                         );
                                     if (quotedTweet) {
                                         quotedContent = `\nQuoted Tweet from @${quotedTweet.username}:\n${quotedTweet.text}`;
@@ -650,33 +621,12 @@ export class TwitterPostClient {
                             // Send the tweet through request queue
                             const result = await this.client.requestQueue.add(
                                 async () =>
-                                    await this.client.twitterClient.sendQuoteTweet(
+                                    await this.client.quoteTweet(
                                         quoteContent,
                                         tweet.id
                                     )
                             );
 
-                            const body = await result.json();
-
-                            if (
-                                body?.data?.create_tweet?.tweet_results?.result
-                            ) {
-                                elizaLogger.log(
-                                    "Successfully posted quote tweet"
-                                );
-                                executedActions.push("quote");
-
-                                // Cache generation context for debugging
-                                await this.runtime.cacheManager.set(
-                                    `twitter/quote_generation_${tweet.id}.txt`,
-                                    `Context:\n${enrichedState}\n\nGenerated Quote:\n${quoteContent}`
-                                );
-                            } else {
-                                elizaLogger.error(
-                                    "Quote tweet creation failed:",
-                                    body
-                                );
-                            }
                         } catch (error) {
                             elizaLogger.error(
                                 "Error in quote tweet generation:",
@@ -703,9 +653,9 @@ export class TwitterPostClient {
                     // Add these checks before creating memory
                     await this.runtime.ensureRoomExists(roomId);
                     await this.runtime.ensureUserExists(
-                        stringToUuid(tweet.userId),
+                        stringToUuid(tweet.authorId),
                         tweet.username,
-                        tweet.name,
+                        tweet.authorName,
                         "twitter"
                     );
                     await this.runtime.ensureParticipantInRoom(
@@ -716,7 +666,7 @@ export class TwitterPostClient {
                     // Then create the memory
                     await this.runtime.messageManager.createMemory({
                         id: stringToUuid(tweet.id + "-" + this.runtime.agentId),
-                        userId: stringToUuid(tweet.userId),
+                        userId: stringToUuid(tweet.authorId),
                         content: {
                             text: tweet.text,
                             url: tweet.permanentUrl,
@@ -753,7 +703,7 @@ export class TwitterPostClient {
     }
 
     private async handleTextOnlyReply(
-        tweet: Tweet,
+        tweet: ProcessedTweet,
         tweetState: any,
         executedActions: string[]
     ) {
@@ -776,18 +726,18 @@ export class TwitterPostClient {
                         .getService<IImageDescriptionService>(
                             ServiceType.IMAGE_DESCRIPTION
                         )
-                        .describeImage(photo.url);
+                        .describeImage(photo);
                     imageDescriptions.push(description);
                 }
             }
 
             // Handle quoted tweet if present
             let quotedContent = "";
-            if (tweet.quotedStatusId) {
+            if (tweet.id) {
                 try {
                     const quotedTweet =
-                        await this.client.twitterClient.getTweet(
-                            tweet.quotedStatusId
+                        await this.client.getTweet(
+                            tweet.id
                         );
                     if (quotedTweet) {
                         quotedContent = `\nQuoted Tweet from @${quotedTweet.username}:\n${quotedTweet.text}`;
@@ -837,26 +787,11 @@ export class TwitterPostClient {
             // Send the tweet through request queue
             const result = await this.client.requestQueue.add(
                 async () =>
-                    await this.client.twitterClient.sendTweet(
+                    await this.client.sendTweet(
                         replyText,
                         tweet.id
                     )
             );
-
-            const body = await result.json();
-
-            if (body?.data?.create_tweet?.tweet_results?.result) {
-                elizaLogger.log("Successfully posted reply tweet");
-                executedActions.push("reply");
-
-                // Cache generation context for debugging
-                await this.runtime.cacheManager.set(
-                    `twitter/reply_generation_${tweet.id}.txt`,
-                    `Context:\n${enrichedState}\n\nGenerated Reply:\n${replyText}`
-                );
-            } else {
-                elizaLogger.error("Tweet reply creation failed:", body);
-            }
         } catch (error) {
             elizaLogger.error("Error in handleTextOnlyReply:", error);
         }

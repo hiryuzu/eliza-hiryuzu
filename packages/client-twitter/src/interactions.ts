@@ -1,4 +1,3 @@
-import { SearchMode, Tweet } from "agent-twitter-client";
 import {
     composeContext,
     generateMessageResponse,
@@ -15,8 +14,8 @@ import {
     elizaLogger,
     getEmbeddingZeroVector,
 } from "@elizaos/core";
-import { ClientBase } from "./base";
-import { buildConversationThread, sendTweet, wait } from "./utils.ts";
+import { ClientBase, ProcessedTweet } from "./base";
+import { wait } from "./utils.ts";
 
 export const twitterMessageHandlerTemplate =
     `
@@ -95,207 +94,118 @@ export class TwitterInteractionClient {
     }
 
     async start() {
-        const handleTwitterInteractionsLoop = () => {
-            this.handleTwitterInteractions();
-            setTimeout(
-                handleTwitterInteractionsLoop,
-                Number(
-                    this.runtime.getSetting("TWITTER_POLL_INTERVAL") || 120
-                ) * 1000 // Default to 2 minutes
-            );
+        const pollInterval = Number(this.runtime.getSetting("TWITTER_POLL_INTERVAL") || 120) * 1000;
+
+        const handleLoop = async () => {
+            await this.handleTwitterInteractions();
+            setTimeout(handleLoop, pollInterval);
         };
-        handleTwitterInteractionsLoop();
+
+        handleLoop();
     }
 
     async handleTwitterInteractions() {
         elizaLogger.log("Checking Twitter interactions");
-        // Read from environment variable, fallback to default list if not set
-        const targetUsersStr = this.runtime.getSetting("TWITTER_TARGET_USERS");
 
-        const twitterUsername = this.client.profile.username;
         try {
-            // Check for mentions
-            const mentionCandidates = (
-                await this.client.fetchSearchTweets(
-                    `@${twitterUsername}`,
-                    20,
-                    SearchMode.Latest
-                )
-            ).tweets;
+            const mentionCandidates = await this.fetchMentionedTweets();
+            const targetUserTweets = await this.fetchTargetUserTweets();
 
-            elizaLogger.log(
-                "Completed checking mentioned tweets:",
-                mentionCandidates.length
-            );
-            let uniqueTweetCandidates = [...mentionCandidates];
-            // Only process target users if configured
-            if (targetUsersStr && targetUsersStr.trim()) {
-                const TARGET_USERS = targetUsersStr
-                    .split(",")
-                    .map((u) => u.trim())
-                    .filter((u) => u.length > 0); // Filter out empty strings after split
+            // Merge and deduplicate tweet candidates
+            const allCandidates = this.mergeTweetCandidates(mentionCandidates, targetUserTweets);
 
-                elizaLogger.log("Processing target users:", TARGET_USERS);
-
-                if (TARGET_USERS.length > 0) {
-                    // Create a map to store tweets by user
-                    const tweetsByUser = new Map<string, Tweet[]>();
-
-                    // Fetch tweets from all target users
-                    for (const username of TARGET_USERS) {
-                        try {
-                            const userTweets = (
-                                await this.client.twitterClient.fetchSearchTweets(
-                                    `from:${username}`,
-                                    3,
-                                    SearchMode.Latest
-                                )
-                            ).tweets;
-
-                            // Filter for unprocessed, non-reply, recent tweets
-                            const validTweets = userTweets.filter((tweet) => {
-                                const isUnprocessed =
-                                    !this.client.lastCheckedTweetId ||
-                                    parseInt(tweet.id) >
-                                        this.client.lastCheckedTweetId;
-                                const isRecent =
-                                    Date.now() - tweet.timestamp * 1000 <
-                                    2 * 60 * 60 * 1000;
-
-                                elizaLogger.log(`Tweet ${tweet.id} checks:`, {
-                                    isUnprocessed,
-                                    isRecent,
-                                    isReply: tweet.isReply,
-                                    isRetweet: tweet.isRetweet,
-                                });
-
-                                return (
-                                    isUnprocessed &&
-                                    !tweet.isReply &&
-                                    !tweet.isRetweet &&
-                                    isRecent
-                                );
-                            });
-
-                            if (validTweets.length > 0) {
-                                tweetsByUser.set(username, validTweets);
-                                elizaLogger.log(
-                                    `Found ${validTweets.length} valid tweets from ${username}`
-                                );
-                            }
-                        } catch (error) {
-                            elizaLogger.error(
-                                `Error fetching tweets for ${username}:`,
-                                error
-                            );
-                            continue;
-                        }
-                    }
-
-                    // Select one tweet from each user that has tweets
-                    const selectedTweets: Tweet[] = [];
-                    for (const [username, tweets] of tweetsByUser) {
-                        if (tweets.length > 0) {
-                            // Randomly select one tweet from this user
-                            const randomTweet =
-                                tweets[
-                                    Math.floor(Math.random() * tweets.length)
-                                ];
-                            selectedTweets.push(randomTweet);
-                            elizaLogger.log(
-                                `Selected tweet from ${username}: ${randomTweet.text?.substring(0, 100)}`
-                            );
-                        }
-                    }
-
-                    // Add selected tweets to candidates
-                    uniqueTweetCandidates = [
-                        ...mentionCandidates,
-                        ...selectedTweets,
-                    ];
-                }
-            } else {
-                elizaLogger.log(
-                    "No target users configured, processing only mentions"
-                );
+            // Process each tweet
+            for (const tweet of allCandidates) {
+                await this.processTweetIfNeeded(tweet);
             }
 
-            // Sort tweet candidates by ID in ascending order
-            uniqueTweetCandidates
-                .sort((a, b) => a.id.localeCompare(b.id))
-                .filter((tweet) => tweet.userId !== this.client.profile.id);
-
-            // for each tweet candidate, handle the tweet
-            for (const tweet of uniqueTweetCandidates) {
-                if (
-                    !this.client.lastCheckedTweetId ||
-                    BigInt(tweet.id) > this.client.lastCheckedTweetId
-                ) {
-                    // Generate the tweetId UUID the same way it's done in handleTweet
-                    const tweetId = stringToUuid(
-                        tweet.id + "-" + this.runtime.agentId
-                    );
-
-                    // Check if we've already processed this tweet
-                    const existingResponse =
-                        await this.runtime.messageManager.getMemoryById(
-                            tweetId
-                        );
-
-                    if (existingResponse) {
-                        elizaLogger.log(
-                            `Already responded to tweet ${tweet.id}, skipping`
-                        );
-                        continue;
-                    }
-                    elizaLogger.log("New Tweet found", tweet.permanentUrl);
-
-                    const roomId = stringToUuid(
-                        tweet.conversationId + "-" + this.runtime.agentId
-                    );
-
-                    const userIdUUID =
-                        tweet.userId === this.client.profile.id
-                            ? this.runtime.agentId
-                            : stringToUuid(tweet.userId!);
-
-                    await this.runtime.ensureConnection(
-                        userIdUUID,
-                        roomId,
-                        tweet.username,
-                        tweet.name,
-                        "twitter"
-                    );
-
-                    const thread = await buildConversationThread(
-                        tweet,
-                        this.client
-                    );
-
-                    const message = {
-                        content: { text: tweet.text },
-                        agentId: this.runtime.agentId,
-                        userId: userIdUUID,
-                        roomId,
-                    };
-
-                    await this.handleTweet({
-                        tweet,
-                        message,
-                        thread,
-                    });
-
-                    // Update the last checked tweet ID after processing each tweet
-                    this.client.lastCheckedTweetId = BigInt(tweet.id);
-                }
-            }
-
-            // Save the latest checked tweet ID to the file
+            // Update the last checked tweet ID
             await this.client.cacheLatestCheckedTweetId();
 
-            elizaLogger.log("Finished checking Twitter interactions");
+            elizaLogger.log("Finished checking Twitter interactions.");
         } catch (error) {
             elizaLogger.error("Error handling Twitter interactions:", error);
+        }
+    }
+
+    private async fetchMentionedTweets(): Promise<ProcessedTweet[]> {
+        const username = this.client.profile.username;
+        const mentionCandidates = await this.client.fetchSearchTweets(`@${username}`, 20);
+        elizaLogger.log(`Fetched ${mentionCandidates.length} mentioned tweets.`);
+        return mentionCandidates;
+    }
+
+    private async fetchTargetUserTweets(): Promise<ProcessedTweet[]> {
+        const targetUsersStr = this.runtime.getSetting("TWITTER_TARGET_USERS") || "";
+        const targetUsers = targetUsersStr.split(",").map((u) => u.trim()).filter(Boolean);
+
+        if (!targetUsers.length) {
+            elizaLogger.log("No target users configured.");
+            return [];
+        }
+
+        elizaLogger.log(`Fetching tweets for target users: ${targetUsers.join(", ")}`);
+        const tweets: ProcessedTweet[] = [];
+
+        for (const username of targetUsers) {
+            try {
+                const userTweets = await this.client.fetchSearchTweets(`from:${username}`, 3);
+                tweets.push(...userTweets);
+            } catch (error) {
+                elizaLogger.error(`Error fetching tweets for user ${username}:`, error);
+            }
+        }
+
+        return tweets;
+    }
+
+    private mergeTweetCandidates(
+        mentions: ProcessedTweet[],
+        targetTweets: ProcessedTweet[]
+    ): ProcessedTweet[] {
+        const allCandidates = [...mentions, ...targetTweets];
+        const uniqueCandidates = allCandidates
+            .filter((tweet, index, self) => self.findIndex((t) => t.id === tweet.id) === index)
+            .sort((a, b) => a.id.localeCompare(b.id));
+
+        elizaLogger.log(`Merged ${allCandidates.length} tweets into ${uniqueCandidates.length} unique candidates.`);
+        return uniqueCandidates;
+    }
+
+    private async processTweetIfNeeded(tweet: ProcessedTweet) {
+        if (!this.client.lastCheckedTweetId || BigInt(tweet.id) > this.client.lastCheckedTweetId) {
+            const tweetIdUUID = stringToUuid(tweet.id + "-" + this.runtime.agentId);
+
+            const existingResponse = await this.runtime.messageManager.getMemoryById(tweetIdUUID);
+            if (existingResponse) {
+                elizaLogger.log(`Tweet ${tweet.id} already processed, skipping.`);
+                return;
+            }
+
+            const roomId = stringToUuid(tweet.conversationId + "-" + this.runtime.agentId);
+            const userIdUUID =
+                tweet.authorId === this.client.profile.id
+                    ? this.runtime.agentId
+                    : stringToUuid(tweet.authorId);
+
+            await this.runtime.ensureConnection(userIdUUID, roomId, tweet.username, tweet.authorName, "twitter");
+
+            const thread = await this.buildConversationThread(tweet, 10);
+
+            const message = {
+                content: { text: tweet.text },
+                agentId: this.runtime.agentId,
+                userId: userIdUUID,
+                roomId,
+            };
+
+            await this.handleTweet({
+                tweet,
+                message,
+                thread,
+            });
+
+            this.client.lastCheckedTweetId = BigInt(tweet.id);
         }
     }
 
@@ -304,11 +214,11 @@ export class TwitterInteractionClient {
         message,
         thread,
     }: {
-        tweet: Tweet;
+        tweet: ProcessedTweet;
         message: Memory;
-        thread: Tweet[];
+        thread: ProcessedTweet[];
     }) {
-        if (tweet.userId === this.client.profile.id) {
+        if (tweet.authorId === this.client.profile.id) {
             // console.log("skipping tweet from bot itself", tweet.id);
             // Skip processing if the tweet is from the bot itself
             return;
@@ -320,10 +230,10 @@ export class TwitterInteractionClient {
         }
 
         elizaLogger.log("Processing Tweet: ", tweet.id);
-        const formatTweet = (tweet: Tweet) => {
+        const formatTweet = (tweet: ProcessedTweet) => {
             return `  ID: ${tweet.id}
-  From: ${tweet.name} (@${tweet.username})
-  Text: ${tweet.text}`;
+            From: ${tweet.username} (@${tweet.username})
+            Text: ${tweet.text}`;
         };
         const currentPost = formatTweet(tweet);
 
@@ -358,7 +268,7 @@ export class TwitterInteractionClient {
 
         if (!tweetExists) {
             elizaLogger.log("tweet does not exist, saving");
-            const userIdUUID = stringToUuid(tweet.userId as string);
+            const userIdUUID = stringToUuid(tweet.authorId as string);
             const roomId = stringToUuid(tweet.conversationId);
 
             const message = {
@@ -445,14 +355,19 @@ export class TwitterInteractionClient {
         if (response.text) {
             try {
                 const callback: HandlerCallback = async (response: Content) => {
-                    const memories = await sendTweet(
-                        this.client,
-                        response,
-                        message.roomId,
-                        this.runtime.getSetting("TWITTER_USERNAME"),
-                        tweet.id
-                    );
-                    return memories;
+                    const tweet = await this.client.sendTweet(response.text);
+
+                    // Convert the ProcessedTweet into Memory objects
+                    const memory: Memory = {
+                        id: stringToUuid(tweet.id),
+                        userId: stringToUuid(tweet.authorId),
+                        roomId: stringToUuid(tweet.conversationId),
+                        agentId: this.runtime.agentId,
+                        content: { text: tweet.text, url: tweet.permanentUrl },
+                        createdAt: tweet.timestamp! * 1000,
+                    };
+
+                    return [memory]; // Return as an array of Memory
                 };
 
                 const responseMessages = await callback(response);
@@ -495,14 +410,16 @@ export class TwitterInteractionClient {
         }
     }
 
+
+
     async buildConversationThread(
-        tweet: Tweet,
+        tweet: ProcessedTweet,
         maxReplies: number = 10
-    ): Promise<Tweet[]> {
-        const thread: Tweet[] = [];
+    ): Promise<ProcessedTweet[]> {
+        const thread: ProcessedTweet[] = [];
         const visited: Set<string> = new Set();
 
-        async function processThread(currentTweet: Tweet, depth: number = 0) {
+        async function processThread(currentTweet: ProcessedTweet, depth: number = 0) {
             elizaLogger.log("Processing tweet:", {
                 id: currentTweet.id,
                 inReplyToStatusId: currentTweet.inReplyToStatusId,
@@ -527,13 +444,13 @@ export class TwitterInteractionClient {
                 const roomId = stringToUuid(
                     currentTweet.conversationId + "-" + this.runtime.agentId
                 );
-                const userId = stringToUuid(currentTweet.userId);
+                const authorId = stringToUuid(currentTweet.authorId);
 
                 await this.runtime.ensureConnection(
-                    userId,
+                    authorId,
                     roomId,
                     currentTweet.username,
-                    currentTweet.name,
+                    currentTweet.username,
                     "twitter"
                 );
 
@@ -557,9 +474,9 @@ export class TwitterInteractionClient {
                     createdAt: currentTweet.timestamp * 1000,
                     roomId,
                     userId:
-                        currentTweet.userId === this.twitterUserId
+                        currentTweet.authorId === this.twitterUserId
                             ? this.runtime.agentId
-                            : stringToUuid(currentTweet.userId),
+                            : stringToUuid(currentTweet.authorId),
                     embedding: getEmbeddingZeroVector(),
                 });
             }
